@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Generic fake package manager. Logs its call; list commands print fixtures.
+n=${0##*/}
+printf '%s %s\n' "$n" "$*" >>"$PD_CALLS"
+case "$n $1 $2" in
+  "dpkg-query "*)   cat "$PD_STUB_DIR/apt.list" 2>/dev/null ;;
+  "npm ls"*)        cat "$PD_STUB_DIR/node.list" 2>/dev/null ;;
+  "npm config"*)    echo /nonexistent-prefix ;;
+  "pipx list --json"*) cat "$PD_STUB_DIR/pipx.json" 2>/dev/null ;;
+  "pipx list"*)     cat "$PD_STUB_DIR/pipx.list" 2>/dev/null ;;
+  "composer global show"*) cat "$PD_STUB_DIR/composer.list" 2>/dev/null ;;
+esac
+if [[ $n == sudo ]]; then exec "$@"; fi
+[[ ${PD_STUB_FAIL_FOR:-} == "$n" && $1 =~ ^(install|require)$ ]] && exit 1
+exit 0

@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+# PackageDealer - install packages with apt, npm, pipx and composer, fast.
+#
+# Speed strategy: never ask a package manager "is X installed?" per package.
+# Fetch each manager's installed list once (in parallel), diff in memory,
+# then install everything that is missing in ONE call per manager.
+# Already installed packages are never touched, never upgraded.
+
+PD_VERSION=0.1.0
+
+# Install order matters: apt may provide node/python/php for the others.
+PD_MANAGERS=(apt node pipx composer)
+
+# shellcheck disable=SC2034  # used via namerefs
+declare -a WANT_apt=() WANT_node=() WANT_pipx=() WANT_composer=()
+declare -A PD_SEEN=()
+PD_DRY_RUN=0
+PD_APT_UPDATE=0
+PD_TMP=
+PD_SOURCES=()   # "mode:file" mode = manager name or "mixed"
+
+shopt -s extglob
+
+pd_usage() {
+  cat <<'EOF'
+Usage: PackageDealer [options]
+
+Install packages globally; skip what is already installed.
+
+Options:
+  -a, --apt FILE        file with apt packages, one per line
+  -n, --node FILE       file with npm packages (installed with npm -g)
+  -p, --pipx FILE       file with pipx packages
+  -c, --composer FILE   file with composer packages (composer global require)
+  -f, --file FILE       file with prefixed lines: a:foo n:bar p:baz c:vendor/pkg
+  -u, --update          run apt-get update before installing (only if apt has work)
+  -d, --dry-run         only print what would be installed
+  -h, --help            show this help
+  -V, --version         show version
+
+FILE may be given several times, "-" reads stdin. Blank lines and
+'#' comments are ignored. Environment: PD_NPM_PREFIX (npm prefix used when
+the default one is not writable, default ~/.local).
+EOF
+}
+
+pd_log() { printf 'PackageDealer: %s\n' "$*" >&2; }
+pd_die() { pd_log "error: $*"; exit 1; }
+
+# ---------------------------------------------------------------- parsing
+
+pd_short_to_manager() {
+  case $1 in
+    a) REPLY=apt ;;
+    n) REPLY=node ;;
+    p) REPLY=pipx ;;
+    c) REPLY=composer ;;
+    *) return 1 ;;
+  esac
+}
+
+pd_add_want() {
+  local mgr=$1 spec=$2
+  [[ -n ${PD_SEEN["$mgr|$spec"]:-} ]] && return 0
+  PD_SEEN["$mgr|$spec"]=1
+  local -n _list="WANT_$mgr"
+  _list+=("$spec")
+}
+
+# pd_read_file MODE FILE   (MODE = manager name, or "mixed" for prefixed lines)
+pd_read_file() {
+  local mode=$1 file=$2 line mgr n=0
+  if [[ $file == - ]]; then
+    exec 3<&0
+  else
+    [[ -r $file ]] || pd_die "cannot read file: $file"
+    exec 3<"$file"
+  fi
+  while IFS= read -r line <&3 || [[ -n $line ]]; do
+    n=$((n + 1))
+    line=${line%%#*}
+    line=${line##+([[:space:]])}
+    line=${line%%+([[:space:]])}
+    [[ -z $line ]] && continue
+    if [[ $mode == mixed ]]; then
+      [[ $line =~ ^([a-z]):[[:space:]]*(.+)$ ]] \
+        && pd_short_to_manager "${BASH_REMATCH[1]}" \
+        || pd_die "$file:$n: expected a:|n:|p:|c: prefix, got '$line'"
+      mgr=$REPLY
+      line=${BASH_REMATCH[2]}
+    else
+      mgr=$mode
+    fi
+    pd_add_want "$mgr" "$line"
+  done
+  exec 3<&-
+}
+
+# ------------------------------------------------------------ name keys
+# pd_key MANAGER SPEC -> sets REPLY to the name used to compare against the
+# installed list (version pins etc. stripped). No forks: this runs per package.
+
+pd_key() {
+  local mgr=$1 s=$2 n
+  case $mgr in
+    apt)
+      n=${s%%[=/]*}          # foo=1.2  foo/release
+      REPLY=$n ;;            # foo:arch is kept, installed list has both forms
+    node)
+      if [[ $s == @* ]]; then n=${s:1}; REPLY=@${n%%@*}; else REPLY=${s%%@*}; fi ;;
+    pipx)
+      if [[ $s == *[/:]* ]]; then REPLY=$s; return 0; fi   # url/path: matched by exact spec
+      n=${s%%[=<>~!\[\ @;]*}
+      n=${n,,}
+      REPLY=${n//+([-_.])/-} ;;
+    composer)
+      n=${s%%[:=^~\ ]*}
+      REPLY=${n,,} ;;
+    *) return 1 ;;
+  esac
+}
+
+# ------------------------------------------------------- installed lists
+# Each prints one key per line, same normalisation as pd_key.
+
+pd_list_apt() {
+  # Also emits Provides: names, so virtual packages with an installed
+  # provider count as present (apt would no-op on them anyway).
+  dpkg-query -W -f='${db:Status-Abbrev} ${Package}:${Architecture} ${Provides}\n' \
+    | awk '$1 == "ii" {
+        split($2, a, ":"); print a[1]; print $2
+        for (i = 3; i <= NF; i++) {
+          gsub(/[,|]/, "", $i)
+          if ($i ~ /^[a-z0-9][a-z0-9+.-]*$/) print $i
+        }
+      }'
+}
+
+pd_list_node() {
+  # npm ls exits non-zero on a missing prefix dir or extraneous packages
+  { npm ls -g --depth=0 --parseable 2>/dev/null || true; } \
+    | awk -F'/node_modules/' 'NF > 1 { print $2 }'
+}
+
+pd_list_pipx() {
+  pipx list --short 2>/dev/null | while read -r name _; do
+    [[ -n $name ]] || continue
+    name=${name,,}
+    printf '%s\n' "${name//+([-_.])/-}"
+  done
+  # URL/path specs have no knowable name; match them by the exact spec pipx
+  # recorded. Extra call, only when such a spec was requested.
+  local spec
+  for spec in "${WANT_pipx[@]}"; do
+    if [[ $spec == *[/:]* ]]; then
+      pipx list --json 2>/dev/null \
+        | sed -n 's/^ *"package_or_url": *"\(.*\)",\{0,1\}$/\1/p'
+      break
+    fi
+  done
+}
+
+pd_list_composer() {
+  composer global show --direct --name-only --no-interaction 2>/dev/null \
+    | awk 'NF { print tolower($1) }'
+}
+
+# ------------------------------------------------------------- installing
+
+pd_as_root() {
+  if [[ ${PD_EUID:-$EUID} -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    pd_die "apt needs root and sudo is not available"
+  fi
+}
+
+pd_install_apt() {
+  if ((PD_APT_UPDATE)); then
+    pd_as_root env DEBIAN_FRONTEND=noninteractive apt-get update || return 1
+  fi
+  pd_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-upgrade "$@"
+}
+pd_install_node()     { npm install -g "$@"; }
+pd_install_pipx()     { pipx install "$@"; }
+pd_install_composer() { composer global require --no-interaction "$@"; }
+
+pd_tools_for() {
+  case $1 in
+    apt) REPLY="apt-get dpkg-query" ;;
+    node) REPLY="npm" ;;
+    pipx) REPLY="pipx" ;;
+    composer) REPLY="composer" ;;
+  esac
+}
+
+# Non-root users usually cannot write npm's default global prefix.
+pd_setup_npm_prefix() {
+  [[ -n ${NPM_CONFIG_PREFIX:-} || ${PD_EUID:-$EUID} -eq 0 ]] && return 0
+  local prefix
+  prefix=$(npm config get prefix 2>/dev/null) || return 0
+  if [[ ! -w $prefix ]]; then
+    export NPM_CONFIG_PREFIX=${PD_NPM_PREFIX:-$HOME/.local}
+  fi
+}
+
+# --------------------------------------------------------------- main flow
+
+pd_parse_args() {
+  while (($#)); do
+    case $1 in
+      -a|--apt)      [[ $# -ge 2 ]] || pd_die "$1 needs a file"; PD_SOURCES+=("apt:$2"); shift 2 ;;
+      -n|--node)     [[ $# -ge 2 ]] || pd_die "$1 needs a file"; PD_SOURCES+=("node:$2"); shift 2 ;;
+      -p|--pipx)     [[ $# -ge 2 ]] || pd_die "$1 needs a file"; PD_SOURCES+=("pipx:$2"); shift 2 ;;
+      -c|--composer) [[ $# -ge 2 ]] || pd_die "$1 needs a file"; PD_SOURCES+=("composer:$2"); shift 2 ;;
+      -f|--file)     [[ $# -ge 2 ]] || pd_die "$1 needs a file"; PD_SOURCES+=("mixed:$2"); shift 2 ;;
+      -u|--update)   PD_APT_UPDATE=1; shift ;;
+      -d|--dry-run)  PD_DRY_RUN=1; shift ;;
+      -h|--help)     pd_usage; exit 0 ;;
+      -V|--version)  echo "PackageDealer $PD_VERSION"; exit 0 ;;
+      *)             pd_usage >&2; pd_die "unknown argument: $1" ;;
+    esac
+  done
+  local src
+  for src in "${PD_SOURCES[@]}"; do
+    pd_read_file "${src%%:*}" "${src#*:}"
+  done
+}
+
+# pd_compute_missing MANAGER OUTVAR
+pd_compute_missing() {
+  local mgr=$1
+  local -n _missing=$2
+  local -n _want="WANT_$mgr"
+  local -A have=()
+  local key spec
+  while IFS= read -r key; do have[$key]=1; done <"$PD_TMP/$mgr"
+  _missing=()
+  for spec in "${_want[@]}"; do
+    pd_key "$mgr" "$spec"
+    [[ -n ${have[$REPLY]:-} ]] || _missing+=("$spec")
+  done
+}
+
+pd_main() {
+  pd_parse_args "$@"
+
+  local mgr tool active=()
+  for mgr in "${PD_MANAGERS[@]}"; do
+    local -n _w="WANT_$mgr"
+    ((${#_w[@]})) && active+=("$mgr")
+    unset -n _w
+  done
+  if ((${#active[@]} == 0)); then
+    pd_log "nothing to do"
+    return 0
+  fi
+
+  # Fail early, before anything is installed.
+  for mgr in "${active[@]}"; do
+    pd_tools_for "$mgr"
+    for tool in $REPLY; do
+      command -v "$tool" >/dev/null 2>&1 || pd_die "$mgr requested but '$tool' not found"
+    done
+  done
+
+  PD_TMP=$(mktemp -d)
+  trap 'rm -rf "$PD_TMP"' EXIT
+
+  [[ " ${active[*]} " == *" node "* ]] && pd_setup_npm_prefix
+
+  # One list call per manager, all in parallel.
+  local -A pids=()
+  for mgr in "${active[@]}"; do
+    "pd_list_$mgr" >"$PD_TMP/$mgr" 2>"$PD_TMP/$mgr.err" &
+    pids[$mgr]=$!
+  done
+  local failed=0
+  for mgr in "${active[@]}"; do
+    wait "${pids[$mgr]}" || {
+      pd_log "error: could not list installed $mgr packages: $(head -n1 "$PD_TMP/$mgr.err")"
+      failed=1
+    }
+  done
+  ((failed)) && return 1
+
+  # Sequential installs, one batch per manager.
+  local rc=0 missing
+  for mgr in "${active[@]}"; do
+    pd_compute_missing "$mgr" missing
+    local -n _w="WANT_$mgr"
+    pd_log "$mgr: ${#missing[@]} to install, $((${#_w[@]} - ${#missing[@]})) already present"
+    unset -n _w
+    ((${#missing[@]})) || continue
+    if ((PD_DRY_RUN)); then
+      printf '%s: %s\n' "$mgr" "${missing[*]}"
+      continue
+    fi
+    "pd_install_$mgr" "${missing[@]}" || { pd_log "error: $mgr install failed"; rc=1; }
+  done
+  return $rc
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  set -euo pipefail
+  pd_main "$@"
+fi
