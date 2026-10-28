@@ -15,6 +15,10 @@ case "$n $1 $2" in
   "composer global show"*) cat "$PD_STUB_DIR/composer.list" 2>/dev/null ;;
 esac
 for v in ${PD_STUB_ENV:-}; do printf 'env %s=%s\n' "$v" "${!v-}" >>"$PD_CALLS"; done
+# apt-get install can "provide" tools: PD_STUB_PROVIDES="pipx npm"
+if [[ $n == apt-get && ${1:-} == install && -n ${PD_STUB_PROVIDES:-} ]]; then
+  for v in $PD_STUB_PROVIDES; do ln -sf "$0" "$PD_STUB_DIR/bin/$v"; done
+fi
 if [[ $n == sudo ]]; then exec "$@"; fi
 [[ ${PD_STUB_FAIL_FOR:-} == "$n" && $1 =~ ^(install|require)$ ]] && exit 1
 exit 0

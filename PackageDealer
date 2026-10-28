@@ -416,6 +416,16 @@ pd_tools_for() {
   esac
 }
 
+# pd_missing_tool MANAGER: if one of its tools is missing, set REPLY to it, return 0
+pd_missing_tool() {
+  local tool
+  pd_tools_for "$1"
+  for tool in $REPLY; do
+    if ! command -v "$tool" >/dev/null 2>&1; then REPLY=$tool; return 0; fi
+  done
+  return 1
+}
+
 # Non-root users usually cannot write npm's default global prefix.
 pd_setup_node() {
   [[ -n ${NPM_CONFIG_PREFIX:-} ]] && return 0
@@ -518,7 +528,7 @@ pd_compute_missing() {
 pd_main() {
   pd_parse_args "$@"
 
-  local mgr tool active=()
+  local mgr active=()
   for mgr in "${PD_MANAGERS[@]}"; do
     local -n _w="WANT_$mgr"
     ((${#_w[@]})) && active+=("$mgr")
@@ -529,29 +539,39 @@ pd_main() {
     return 0
   fi
 
-  # Fail early, before anything is installed.
+  # Fail early, before anything is installed. Exception: if apt is part of
+  # this run, a missing tool of another manager may be installed by apt
+  # (e.g. pipx, npm, composer): that manager is deferred until apt is done.
+  local -A deferred=()
+  local with_apt=0 started=()
+  [[ " ${active[*]} " == *" apt "* ]] && with_apt=1
   for mgr in "${active[@]}"; do
-    pd_tools_for "$mgr"
-    for tool in $REPLY; do
-      command -v "$tool" >/dev/null 2>&1 || pd_die "$mgr requested but '$tool' not found"
-    done
+    if pd_missing_tool "$mgr"; then
+      if ((with_apt)) && [[ $mgr != apt ]]; then
+        deferred[$mgr]=1
+      else
+        pd_die "$mgr requested but '$REPLY' not found"
+      fi
+    else
+      started+=("$mgr")
+    fi
   done
 
   PD_TMP=$(mktemp -d)
   trap 'rm -rf "$PD_TMP"' EXIT
 
-  for mgr in "${active[@]}"; do
+  for mgr in "${started[@]}"; do
     if declare -F "pd_setup_$mgr" >/dev/null; then "pd_setup_$mgr"; fi
   done
 
   # One list call per manager, all in parallel.
   local -A pids=()
-  for mgr in "${active[@]}"; do
+  for mgr in "${started[@]}"; do
     "pd_list_$mgr" >"$PD_TMP/$mgr" 2>"$PD_TMP/$mgr.err" &
     pids[$mgr]=$!
   done
   local failed=0
-  for mgr in "${active[@]}"; do
+  for mgr in "${started[@]}"; do
     wait "${pids[$mgr]}" || {
       pd_log "error: could not list installed $mgr packages: $(head -n1 "$PD_TMP/$mgr.err")"
       failed=1
@@ -562,6 +582,23 @@ pd_main() {
   # Sequential installs, one batch per manager.
   local rc=0 missing present todo ups any_missing=0 attempted=()
   for mgr in "${active[@]}"; do
+    if [[ -n ${deferred[$mgr]:-} ]]; then
+      if ((PD_DRY_RUN)); then
+        : >"$PD_TMP/$mgr"   # tool not installed yet: nothing of it is installed
+      else
+        if pd_missing_tool "$mgr"; then
+          pd_log "error: $mgr: '$REPLY' still not found after installing apt packages"
+          rc=1
+          continue
+        fi
+        if declare -F "pd_setup_$mgr" >/dev/null; then "pd_setup_$mgr"; fi
+        if ! "pd_list_$mgr" >"$PD_TMP/$mgr" 2>"$PD_TMP/$mgr.err"; then
+          pd_log "error: could not list installed $mgr packages: $(head -n1 "$PD_TMP/$mgr.err")"
+          rc=1
+          continue
+        fi
+      fi
+    fi
     pd_compute_missing "$mgr" missing present
     todo=("${missing[@]}")
     ups=()

@@ -125,7 +125,8 @@ Pins are allowed (except for gems) and are stripped when checking whether a pack
 ## Behaviour details
 
 - **Order:** apt, node, pipx, composer, cargo, gem, go. apt comes first because it often provides node, python, php, ruby, rust or go for the others.
-- **Failures:** a missing tool aborts before anything is installed. If one manager's install fails, the others still run and the exit code is 1.
+- **Tools installed by apt:** if apt is part of the run and another manager's tool (`pipx`, `npm`, `composer`, `cargo`, `gem`, `go`) is missing, that manager waits until apt is done. Its installed list is then read and its packages installed. If apt did not provide the tool, that manager fails with an error. Without apt in the run, a missing tool aborts before anything is installed. With `--dry-run` / `--check`, everything of such a manager is reported as missing.
+- **Failures:** a missing tool aborts before anything is installed (see above). If one manager's install fails, the others still run and the exit code is 1.
 - **`--upgrade`:** only the packages named in your files are upgraded, never everything that is installed. Without the flag nothing is ever upgraded. Per manager:
   - apt: one `apt-get install` for all listed packages, without `--no-upgrade`.
   - node: `npm install -g name@latest`; pinned specs (`name@5`) install exactly that.

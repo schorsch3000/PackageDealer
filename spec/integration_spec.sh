@@ -332,7 +332,7 @@ JSON
       echo foo >"$PD_SANDBOX/c.txt"
       rm "$PD_SANDBOX/bin/composer"
       # PATH holds only the stubs, so a real composer on the host cannot leak in
-      When run env PATH="$PD_SANDBOX/bin" "$(command -v bash)" "$PD_ROOT/PackageDealer" --composer "$PD_SANDBOX/c.txt"
+      When run pd_isolated --composer "$PD_SANDBOX/c.txt"
       The status should be failure
       The stderr should include "'composer' not found"
     End
@@ -363,5 +363,62 @@ JSON
       The status should be success
       The stderr should include 'nothing to do'
     End
+  End
+End
+
+Describe 'PackageDealer tools installed by apt in the same run'
+  pd() { pd_isolated "$@"; }
+  BeforeEach pd_sandbox
+  AfterEach pd_sandbox_cleanup
+
+  apt_before_pipx() {
+    awk '/apt-get install/ { a = NR } /pipx install/ { p = NR } END { exit !(a && p && a < p) }' "$PD_CALLS"
+  }
+
+  It 'defers a manager whose tool apt installs, and runs it after apt'
+    rm "$PD_SANDBOX/bin/pipx"
+    export PD_STUB_PROVIDES=pipx
+    echo pipx >"$PD_SANDBOX/apt.txt"; echo black >"$PD_SANDBOX/p.txt"
+    pd --apt "$PD_SANDBOX/apt.txt" --pipx "$PD_SANDBOX/p.txt" 2>/dev/null
+    When call apt_before_pipx
+    The status should be success
+    The contents of file "$PD_CALLS" should include 'pipx list --short --global'
+    The contents of file "$PD_CALLS" should include 'pipx install --global black'
+  End
+
+  It 'works from a -D directory like a layered image'
+    rm "$PD_SANDBOX/bin/pipx"
+    export PD_STUB_PROVIDES=pipx
+    mkdir "$PD_SANDBOX/d"; echo pipx >"$PD_SANDBOX/d/x.apt"; echo black >"$PD_SANDBOX/d/x.pipx"
+    When run pd --clean --update -D "$PD_SANDBOX/d"
+    The status should be success
+    The stderr should be present
+    The contents of file "$PD_CALLS" should include 'pipx install --global black'
+  End
+
+  It 'fails for that manager if apt did not provide the tool, but still finishes apt'
+    rm "$PD_SANDBOX/bin/pipx"
+    echo foo >"$PD_SANDBOX/apt.txt"; echo black >"$PD_SANDBOX/p.txt"
+    When run pd --apt "$PD_SANDBOX/apt.txt" --pipx "$PD_SANDBOX/p.txt"
+    The status should be failure
+    The stderr should include "pipx: 'pipx' still not found after installing apt packages"
+    The contents of file "$PD_CALLS" should include 'apt-get install'
+  End
+
+  It 'dry run lists everything of a deferred manager as missing'
+    rm "$PD_SANDBOX/bin/pipx"
+    echo pipx >"$PD_SANDBOX/apt.txt"; echo black >"$PD_SANDBOX/p.txt"
+    When run pd -d --apt "$PD_SANDBOX/apt.txt" --pipx "$PD_SANDBOX/p.txt"
+    The status should be success
+    The output should include 'pipx: black'
+    The stderr should be present
+  End
+
+  It 'still fails early without apt in the run'
+    rm "$PD_SANDBOX/bin/pipx"
+    echo black >"$PD_SANDBOX/p.txt"
+    When run pd --pipx "$PD_SANDBOX/p.txt"
+    The status should be failure
+    The stderr should include "'pipx' not found"
   End
 End

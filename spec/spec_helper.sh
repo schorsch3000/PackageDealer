@@ -12,6 +12,12 @@ pd_sandbox() {
   for n in dpkg-query apt-get npm pipx composer cargo gem go sudo; do
     ln -s "$PD_ROOT/spec/support/stub" "$PD_SANDBOX/bin/$n"
   done
+  # Minimal system tools for runs where PATH must hold nothing but stubs, so
+  # a real pipx/composer/... on the host can never leak into a test.
+  mkdir -p "$PD_SANDBOX/sysbin"
+  for n in bash mktemp rm head awk sed cat env grep ln; do
+    ln -s "$(command -v "$n")" "$PD_SANDBOX/sysbin/$n"
+  done
   export PD_CALLS="$PD_SANDBOX/calls"
   export PD_STUB_DIR="$PD_SANDBOX"
   export PATH="$PD_SANDBOX/bin:$PATH"
@@ -32,3 +38,8 @@ pd_sandbox_cleanup() { rm -rf "$PD_SANDBOX"; }
 pd_fixture() { cat >"$PD_SANDBOX/$1.list"; }
 
 pd_calls_of() { grep -c "^$1 " "$PD_CALLS" || true; }
+
+# Run PackageDealer with a PATH of only stubs + minimal system tools.
+pd_isolated() {
+  env PATH="$PD_SANDBOX/bin:$PD_SANDBOX/sysbin" "$BASH" "$PD_ROOT/PackageDealer" "$@" </dev/null
+}
