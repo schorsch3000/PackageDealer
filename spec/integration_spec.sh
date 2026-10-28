@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 Describe 'PackageDealer CLI'
-  pd() { "$PD_ROOT/PackageDealer" "$@"; }
+  pd() { "$PD_ROOT/PackageDealer" "$@" </dev/null; }
+  pd_stdin() { "$PD_ROOT/PackageDealer" "$@"; }
   calls() { cat "$PD_CALLS"; }
   BeforeEach pd_sandbox
   AfterEach pd_sandbox_cleanup
@@ -92,10 +93,94 @@ Describe 'PackageDealer CLI'
 
     It 'reads stdin with -'
       Data 'a:foo'
-      When run pd --file -
+      When run pd_stdin --file -
       The status should be success
       The stderr should be present
       The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade foo'
+    End
+
+    It 'assumes -f - when stdin is not a tty and no - was given'
+      Data 'n:bar'
+      When run pd_stdin
+      The status should be success
+      The stderr should be present
+      The contents of file "$PD_CALLS" should include 'npm install -g bar'
+    End
+
+    It 'assumes -f - even when other files are given'
+      echo foo >"$PD_SANDBOX/a.txt"
+      Data 'n:bar'
+      When run pd_stdin --apt "$PD_SANDBOX/a.txt"
+      The status should be success
+      The stderr should be present
+      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade foo'
+      The contents of file "$PD_CALLS" should include 'npm install -g bar'
+    End
+
+    It 'does not add implicit stdin when - was given explicitly'
+      Data 'foo'
+      When run pd_stdin --apt -
+      The status should be success
+      The stderr should include 'apt: 1 to install'
+      The contents of file "$PD_CALLS" should not include 'npm'
+    End
+
+    It 'rejects stdin used twice'
+      When run pd_stdin --apt - --node -
+      The status should be failure
+      The stderr should include "can only be used once"
+    End
+
+    It 'reads -n - as node list'
+      Data
+        #|bar
+      End
+      When run pd_stdin -n -
+      The status should be success
+      The stderr should be present
+      The contents of file "$PD_CALLS" should include 'npm install -g bar'
+    End
+
+    It 'reads -c - as composer list'
+      Data 'vendor/pkg'
+      When run pd_stdin -c -
+      The status should be success
+      The stderr should be present
+      The contents of file "$PD_CALLS" should include 'composer global require --no-interaction vendor/pkg'
+    End
+
+    It 'reads -p - as pipx list'
+      Data 'black'
+      When run pd_stdin -p -
+      The status should be success
+      The stderr should be present
+      The contents of file "$PD_CALLS" should include 'pipx install black'
+    End
+
+    It 'accepts repeated options of the same kind'
+      echo foo >"$PD_SANDBOX/1.txt"; echo bar >"$PD_SANDBOX/2.txt"
+      When run pd -n "$PD_SANDBOX/1.txt" -n "$PD_SANDBOX/2.txt"
+      The status should be success
+      The stderr should include 'node: 2 to install'
+      The contents of file "$PD_CALLS" should include 'npm install -g foo bar'
+    End
+
+    It 'accepts repeated -f files'
+      echo a:foo >"$PD_SANDBOX/1.txt"; echo n:bar >"$PD_SANDBOX/2.txt"
+      When run pd -f "$PD_SANDBOX/1.txt" --file "$PD_SANDBOX/2.txt"
+      The status should be success
+      The stderr should be present
+      The contents of file "$PD_CALLS" should include 'npm install -g bar'
+      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade foo'
+    End
+
+    It 'ignores whitespace-only lines, comments, and whitespace around names'
+      printf '   \n\t\n  # only comment\n\t a:foo\t  # trailing\r\n  n:  bar  \r\n' >"$PD_SANDBOX/all.txt"
+      When run pd -f "$PD_SANDBOX/all.txt"
+      The status should be success
+      The stderr should be present
+      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade foo'
+      The contents of file "$PD_CALLS" should include 'npm install -g bar'
     End
 
     It 'rejects unknown prefix'

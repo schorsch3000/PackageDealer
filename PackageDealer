@@ -16,6 +16,7 @@ declare -a WANT_apt=() WANT_node=() WANT_pipx=() WANT_composer=()
 declare -A PD_SEEN=()
 PD_DRY_RUN=0
 PD_APT_UPDATE=0
+PD_STDIN_USED=0
 PD_TMP=
 PD_SOURCES=()   # "mode:file" mode = manager name or "mixed"
 
@@ -38,8 +39,9 @@ Options:
   -h, --help            show this help
   -V, --version         show version
 
-FILE may be given several times, "-" reads stdin. Blank lines and
-'#' comments are ignored. Environment: PD_NPM_PREFIX (npm prefix used when
+Every file option may be repeated; FILE "-" reads stdin (once). If no "-" is
+given and stdin is not a terminal, "-f -" is assumed. Blank lines, whitespace
+around names and everything after '#' are ignored. Environment: PD_NPM_PREFIX (npm prefix used when
 the default one is not writable, default ~/.local).
 EOF
 }
@@ -83,9 +85,10 @@ pd_read_file() {
     line=${line%%+([[:space:]])}
     [[ -z $line ]] && continue
     if [[ $mode == mixed ]]; then
-      [[ $line =~ ^([a-z]):[[:space:]]*(.+)$ ]] \
-        && pd_short_to_manager "${BASH_REMATCH[1]}" \
-        || pd_die "$file:$n: expected a:|n:|p:|c: prefix, got '$line'"
+      if [[ $line =~ ^([a-z]):[[:space:]]*(.+)$ ]] \
+        && pd_short_to_manager "${BASH_REMATCH[1]}"; then :; else
+        pd_die "$file:$n: expected a:|n:|p:|c: prefix, got '$line'"
+      fi
       mgr=$REPLY
       line=${BASH_REMATCH[2]}
     else
@@ -208,14 +211,25 @@ pd_setup_npm_prefix() {
 
 # --------------------------------------------------------------- main flow
 
+# pd_add_source MODE OPTION FILE...   (called with the remaining args)
+pd_add_source() {
+  local mode=$1 opt=$2
+  [[ $# -ge 3 ]] || pd_die "$opt needs a file"
+  if [[ $3 == - ]]; then
+    ((PD_STDIN_USED)) && pd_die "stdin ('-') can only be used once"
+    PD_STDIN_USED=1
+  fi
+  PD_SOURCES+=("$mode:$3")
+}
+
 pd_parse_args() {
   while (($#)); do
     case $1 in
-      -a|--apt)      [[ $# -ge 2 ]] || pd_die "$1 needs a file"; PD_SOURCES+=("apt:$2"); shift 2 ;;
-      -n|--node)     [[ $# -ge 2 ]] || pd_die "$1 needs a file"; PD_SOURCES+=("node:$2"); shift 2 ;;
-      -p|--pipx)     [[ $# -ge 2 ]] || pd_die "$1 needs a file"; PD_SOURCES+=("pipx:$2"); shift 2 ;;
-      -c|--composer) [[ $# -ge 2 ]] || pd_die "$1 needs a file"; PD_SOURCES+=("composer:$2"); shift 2 ;;
-      -f|--file)     [[ $# -ge 2 ]] || pd_die "$1 needs a file"; PD_SOURCES+=("mixed:$2"); shift 2 ;;
+      -a|--apt)      pd_add_source apt "$@"; shift 2 ;;
+      -n|--node)     pd_add_source node "$@"; shift 2 ;;
+      -p|--pipx)     pd_add_source pipx "$@"; shift 2 ;;
+      -c|--composer) pd_add_source composer "$@"; shift 2 ;;
+      -f|--file)     pd_add_source mixed "$@"; shift 2 ;;
       -u|--update)   PD_APT_UPDATE=1; shift ;;
       -d|--dry-run)  PD_DRY_RUN=1; shift ;;
       -h|--help)     pd_usage; exit 0 ;;
@@ -223,6 +237,10 @@ pd_parse_args() {
       *)             pd_usage >&2; pd_die "unknown argument: $1" ;;
     esac
   done
+  # Piped/redirected stdin and no explicit '-': read it as "-f -".
+  if ((!PD_STDIN_USED)) && [[ ! -t 0 ]]; then
+    PD_SOURCES+=("mixed:-")
+  fi
   local src
   for src in "${PD_SOURCES[@]}"; do
     pd_read_file "${src%%:*}" "${src#*:}"
