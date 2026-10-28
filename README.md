@@ -140,7 +140,7 @@ Every release publishes an image that contains nothing but the script, so no `cu
 
 ```dockerfile
 FROM debian:stable-slim
-COPY --from=ghcr.io/<owner>/packagedealer:1 /usr/local/bin/pd /usr/local/bin/pd
+COPY --from=ghcr.io/schorsch3000/packagedealer:1 /usr/local/bin/pd /usr/local/bin/pd
 COPY packages.txt /tmp/packages.txt
 RUN pd --clean --no-recommends -f /tmp/packages.txt
 ```
@@ -149,7 +149,7 @@ Tags: `1.2.3`, `1.2`, `1` and `latest`. Layering:
 
 ```dockerfile
 FROM my-base                      # may already contain some of the packages
-COPY --from=ghcr.io/<owner>/packagedealer:1 /usr/local/bin/pd /usr/local/bin/pd
+COPY --from=ghcr.io/schorsch3000/packagedealer:1 /usr/local/bin/pd /usr/local/bin/pd
 COPY team.apt team.node /etc/packagedealer.d/
 RUN pd --clean --dir /etc/packagedealer.d
 ```
@@ -170,4 +170,4 @@ Tests use [shellspec](https://github.com/shellspec/shellspec), cloned into `vend
 ## CI and releases
 
 - GitHub Actions runs `make test` and a test build of the image on every push to `main` and on every pull request.
-- Pushing a tag like `v1.2.3` runs the tests, stamps `1.2.3` into the script (`pd --version`), creates a GitHub release with generated notes and the `PackageDealer` script attached, and pushes the image to `ghcr.io/<owner>/packagedealer`.
+- Pushing a tag like `v1.2.3` runs the tests, stamps `1.2.3` into the script (`pd --version`), creates a GitHub release with generated notes and the `PackageDealer` script attached, and pushes the image to `ghcr.io/schorsch3000/packagedealer`.
