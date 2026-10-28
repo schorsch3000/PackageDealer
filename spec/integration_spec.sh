@@ -13,7 +13,7 @@ Describe 'PackageDealer CLI'
       When run pd --apt "$PD_SANDBOX/apt.txt"
       The status should be success
       The stderr should include 'apt: 2 to install, 1 already present'
-      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade git vim'
+      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade -o Acquire::Retries=3 git vim'
       The contents of file "$PD_CALLS" should not include 'curl'"$(printf '\n')"'apt-get'
     End
 
@@ -57,7 +57,7 @@ Describe 'PackageDealer CLI'
       When run pd --pipx "$PD_SANDBOX/pipx.txt"
       The status should be success
       The stderr should include 'pipx: 1 to install'
-      The contents of file "$PD_CALLS" should include 'pipx install black'
+      The contents of file "$PD_CALLS" should include 'pipx install --global black'
     End
 
     It 'installs missing composer packages with global require in one call'
@@ -76,9 +76,9 @@ Describe 'PackageDealer CLI'
       When run pd --file "$PD_SANDBOX/all.txt"
       The status should be success
       The stderr should be present
-      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade foo'
+      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade -o Acquire::Retries=3 foo'
       The contents of file "$PD_CALLS" should include 'npm install -g bar'
-      The contents of file "$PD_CALLS" should include 'pipx install baz'
+      The contents of file "$PD_CALLS" should include 'pipx install --global baz'
       The contents of file "$PD_CALLS" should include 'composer global require --no-interaction vendor/phar'
     End
 
@@ -96,7 +96,7 @@ Describe 'PackageDealer CLI'
       When run pd_stdin --file -
       The status should be success
       The stderr should be present
-      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade foo'
+      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade -o Acquire::Retries=3 foo'
     End
 
     It 'assumes -f - when stdin is not a tty and no - was given'
@@ -113,7 +113,7 @@ Describe 'PackageDealer CLI'
       When run pd_stdin --apt "$PD_SANDBOX/a.txt"
       The status should be success
       The stderr should be present
-      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade foo'
+      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade -o Acquire::Retries=3 foo'
       The contents of file "$PD_CALLS" should include 'npm install -g bar'
     End
 
@@ -154,7 +154,7 @@ Describe 'PackageDealer CLI'
       When run pd_stdin -p -
       The status should be success
       The stderr should be present
-      The contents of file "$PD_CALLS" should include 'pipx install black'
+      The contents of file "$PD_CALLS" should include 'pipx install --global black'
     End
 
     It 'accepts repeated options of the same kind'
@@ -171,7 +171,7 @@ Describe 'PackageDealer CLI'
       The status should be success
       The stderr should be present
       The contents of file "$PD_CALLS" should include 'npm install -g bar'
-      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade foo'
+      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade -o Acquire::Retries=3 foo'
     End
 
     It 'ignores whitespace-only lines, comments, and whitespace around names'
@@ -179,7 +179,7 @@ Describe 'PackageDealer CLI'
       When run pd -f "$PD_SANDBOX/all.txt"
       The status should be success
       The stderr should be present
-      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade foo'
+      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade -o Acquire::Retries=3 foo'
       The contents of file "$PD_CALLS" should include 'npm install -g bar'
     End
 
@@ -187,14 +187,14 @@ Describe 'PackageDealer CLI'
       echo x:foo >"$PD_SANDBOX/all.txt"
       When run pd --file "$PD_SANDBOX/all.txt"
       The status should be failure
-      The stderr should include 'expected a:|n:|p:|c: prefix'
+      The stderr should include 'expected a manager prefix'
     End
 
     It 'rejects missing prefix'
       echo foo >"$PD_SANDBOX/all.txt"
       When run pd --file "$PD_SANDBOX/all.txt"
       The status should be failure
-      The stderr should include 'expected a:|n:|p:|c: prefix'
+      The stderr should include 'expected a manager prefix'
     End
   End
 
@@ -205,7 +205,7 @@ Describe 'PackageDealer CLI'
       When run pd --apt "$PD_SANDBOX/apt.txt"
       The status should be success
       The stderr should include 'apt: 1 to install, 3 already present'
-      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade baz'
+      The contents of file "$PD_CALLS" should include 'apt-get install -y --no-upgrade -o Acquire::Retries=3 baz'
     End
   End
 
@@ -227,7 +227,7 @@ JSON
       When run pd --pipx "$PD_SANDBOX/pipx.txt"
       The status should be success
       The stderr should include 'pipx: 1 to install, 1 already present'
-      The contents of file "$PD_CALLS" should include 'pipx install black'
+      The contents of file "$PD_CALLS" should include 'pipx install --global black'
     End
 
     It 'does not make the extra json call without url specs'
@@ -354,7 +354,7 @@ JSON
       When run pd --node "$PD_SANDBOX/n.txt" --pipx "$PD_SANDBOX/p.txt"
       The status should be failure
       The stderr should include 'node install failed'
-      The contents of file "$PD_CALLS" should include 'pipx install bar'
+      The contents of file "$PD_CALLS" should include 'pipx install --global bar'
     End
 
     It 'does nothing with no input'

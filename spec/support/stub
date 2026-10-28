@@ -8,8 +8,13 @@ case "$n $1 $2" in
   "npm config"*)    echo /nonexistent-prefix ;;
   "pipx list --json"*) cat "$PD_STUB_DIR/pipx.json" 2>/dev/null ;;
   "pipx list"*)     cat "$PD_STUB_DIR/pipx.list" 2>/dev/null ;;
+  "cargo install --list"*) cat "$PD_STUB_DIR/cargo.list" 2>/dev/null ;;
+  "gem list"*)      cat "$PD_STUB_DIR/gem.list" 2>/dev/null ;;
+  "gem env"*)       echo "$PD_STUB_DIR/gemdir" ;;
+  "go version"*)    cat "$PD_STUB_DIR/go.list" 2>/dev/null ;;
   "composer global show"*) cat "$PD_STUB_DIR/composer.list" 2>/dev/null ;;
 esac
+for v in ${PD_STUB_ENV:-}; do printf 'env %s=%s\n' "$v" "${!v-}" >>"$PD_CALLS"; done
 if [[ $n == sudo ]]; then exec "$@"; fi
 [[ ${PD_STUB_FAIL_FOR:-} == "$n" && $1 =~ ^(install|require)$ ]] && exit 1
 exit 0

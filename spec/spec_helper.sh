@@ -9,7 +9,7 @@ pd_sandbox() {
   PD_SANDBOX=$(mktemp -d)
   mkdir -p "$PD_SANDBOX/bin"
   local n
-  for n in dpkg-query apt-get npm pipx composer sudo; do
+  for n in dpkg-query apt-get npm pipx composer cargo gem go sudo; do
     ln -s "$PD_ROOT/spec/support/stub" "$PD_SANDBOX/bin/$n"
   done
   export PD_CALLS="$PD_SANDBOX/calls"
@@ -17,6 +17,12 @@ pd_sandbox() {
   export PATH="$PD_SANDBOX/bin:$PATH"
   export NPM_CONFIG_PREFIX="$PD_SANDBOX/npm"
   export PD_EUID=0
+  # apt index present by default, so no automatic update
+  mkdir -p "$PD_SANDBOX/lists"
+  : >"$PD_SANDBOX/lists/fake_Packages"
+  export PD_APT_LISTS="$PD_SANDBOX/lists"
+  export GOBIN="$PD_SANDBOX/gobin"
+  mkdir -p "$GOBIN"
   : >"$PD_CALLS"
 }
 

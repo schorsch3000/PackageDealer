@@ -1,15 +1,18 @@
 # PackageDealer
 
-One shell script that installs packages with several package managers, and does it fast.
+One shell script that installs packages with several package managers, and does it fast. Built for (multi-level) dev-container images: a base image may already contain some of your packages, PackageDealer installs only what is missing.
 
 Supported managers:
 
-| Manager  | Prefix | Installs with                    | Installed list from                   |
-|----------|--------|----------------------------------|---------------------------------------|
-| apt      | `a:`   | `apt-get install` (via sudo)     | `dpkg-query -W`                       |
-| node     | `n:`   | `npm install -g`                 | `npm ls -g --parseable`               |
-| pipx     | `p:`   | `pipx install`                   | `pipx list --short`                   |
-| composer | `c:`   | `composer global require`        | `composer global show --direct`       |
+| Manager  | Prefix | Long prefix | Installs with                | Installed list from                 |
+|----------|--------|-------------|------------------------------|-------------------------------------|
+| apt      | `a:`   | `apt:`      | `apt-get install`            | `dpkg-query -W`                     |
+| node     | `n:`   | `node:`     | `npm install -g`             | `npm ls -g --parseable`             |
+| pipx     | `p:`   | `pipx:`     | `pipx install`               | `pipx list --short`                 |
+| composer | `c:`   | `composer:` | `composer global require`    | `composer global show --direct`     |
+| cargo    | `r:`   | `cargo:`    | `cargo install`              | `cargo install --list`              |
+| gem      | `e:`   | `gem:`      | `gem install`                | `gem list --local`                  |
+| go       | `g:`   | `go:`       | `go install`                 | `go version -m` on the bin dir      |
 
 ## Why it is fast
 
@@ -17,7 +20,7 @@ PackageDealer never asks a package manager "is X installed?" once per package. F
 
 1. fetches the list of installed packages **once** (all managers in parallel),
 2. removes the already installed packages from your wishlist in memory,
-3. installs everything that is still missing in **one call per manager**.
+3. installs everything that is still missing in **one call per manager** (go: one call per package, see below).
 
 Packages that are already installed are never touched and never upgraded (apt runs with `--no-upgrade`).
 
@@ -25,7 +28,7 @@ Packages that are already installed are never touched and never upgraded (apt ru
 
 - bash 4.4 or newer
 - the package managers you actually use (a manager without packages in your files is not needed)
-- for apt: root, or `sudo`
+- for apt as non-root: `sudo`
 
 ## Usage
 
@@ -40,12 +43,13 @@ pd [options]
 One package per line:
 
 ```
-pd --apt packages.apt --node packages.node --pipx packages.pipx --composer packages.composer
+pd --apt packages.apt --node packages.node --pipx packages.pipx --composer packages.composer \
+   --cargo packages.cargo --gem packages.gem --go packages.go
 ```
 
 ### One file with prefixes
 
-Every line starts with the manager's prefix `a:`, `n:`, `p:` or `c:`:
+Every line starts with the manager's prefix:
 
 ```
 # packages.txt
@@ -54,32 +58,49 @@ a:curl
 n:typescript
 n:@angular/cli
 p:black
-p:yt-dlp
 c:phpunit/phpunit
+r:ripgrep
+e:rubocop
+g:golang.org/x/tools/cmd/goimports
 ```
 
 ```
 pd --file packages.txt
 ```
 
+### A directory of files (layered images)
+
+`--dir DIR` reads every file in `DIR` by extension: `*.apt`, `*.node`, `*.pipx`, `*.composer`, `*.cargo`, `*.gem`, `*.go` (one package per line) and `*.txt` (prefixed lines), in name order. Other files are ignored.
+
+Each image layer drops its own file into a shared directory and runs `pd --dir`; whatever a lower layer already installed is skipped.
+
 ### Options
 
-| Option                | Meaning                                                               |
-|-----------------------|-----------------------------------------------------------------------|
-| `-a`, `--apt FILE`      | apt packages, one per line                                          |
-| `-n`, `--node FILE`     | npm packages, one per line                                          |
-| `-p`, `--pipx FILE`     | pipx packages, one per line                                         |
-| `-c`, `--composer FILE` | composer packages, one per line                                     |
-| `-f`, `--file FILE`     | prefixed lines (`a:foo`, `n:bar`, `p:baz`, `c:vendor/pkg`)          |
-| `-u`, `--update`        | run `apt-get update` first (only if apt has something to install)   |
-| `-d`, `--dry-run`       | print what would be installed, install nothing                      |
-| `-h`, `--help`          | usage                                                               |
-| `-V`, `--version`       | version                                                             |
+| Option                  | Meaning                                                              |
+|-------------------------|----------------------------------------------------------------------|
+| `-a`, `--apt FILE`      | apt packages, one per line                                           |
+| `-n`, `--node FILE`     | npm packages                                                         |
+| `-p`, `--pipx FILE`     | pipx packages                                                        |
+| `-c`, `--composer FILE` | composer packages                                                    |
+| `-r`, `--cargo FILE`    | cargo crates                                                         |
+| `-e`, `--gem FILE`      | ruby gems                                                            |
+| `-g`, `--go FILE`       | go packages (`@latest` is added when no version is given)            |
+| `-f`, `--file FILE`     | prefixed lines                                                       |
+| `-D`, `--dir DIR`       | all recognised files in a directory                                  |
+| `-u`, `--update`        | run `apt-get update` first (only if apt has something to install)    |
+| `-R`, `--no-recommends` | apt: `--no-install-recommends`                                       |
+| `--clean`               | remove package caches of the managers that installed something       |
+| `-d`, `--dry-run`       | print what would be installed, install nothing                       |
+| `--check`               | like `--dry-run`, but exit 1 if anything is missing                  |
+| `-q`, `--quiet`         | only errors; managers get their quiet flags                          |
+| `-v`, `--verbose`       | print every command that is run                                      |
+| `-h`, `--help`          | usage                                                                |
+| `-V`, `--version`       | version                                                              |
 
 - Every file option can be repeated: `pd -n a.txt -n b.txt`.
 - `-` as file name reads stdin (only once per run).
 - If you do not pass `-` anywhere and stdin is not a terminal, `-f -` is assumed, so `echo n:typescript | pd` works.
-  Be aware that a stdin that never closes (for example in cron or some CI setups) makes `pd` wait; redirect from `/dev/null` there.
+  Be aware that a stdin that never closes (for example `docker run -i`, cron or some CI setups) makes `pd` wait; redirect from `/dev/null` there.
 
 ### File format
 
@@ -89,7 +110,7 @@ pd --file packages.txt
 
 ### Version pins
 
-Pins are allowed and are stripped when checking whether a package is installed. A pinned package that is installed in any version counts as present and is not upgraded.
+Pins are allowed (except for gems) and are stripped when checking whether a package is installed. A pinned package that is installed in any version counts as present and is not upgraded.
 
 | Manager  | Examples                              |
 |----------|---------------------------------------|
@@ -97,15 +118,43 @@ Pins are allowed and are stripped when checking whether a package is installed. 
 | node     | `typescript@5`, `@angular/cli@17`     |
 | pipx     | `black==24.1`, `httpie[socks]`        |
 | composer | `phpunit/phpunit:^11`                 |
+| cargo    | `ripgrep@14.1.0`                      |
+| go       | `golang.org/x/tools/cmd/goimports@v0.20.0` |
 
 ## Behaviour details
 
-- **Order:** apt first, then node, pipx, composer, because apt often provides node, python or php for the others.
+- **Order:** apt, node, pipx, composer, cargo, gem, go. apt comes first because it often provides node, python, php, ruby, rust or go for the others.
 - **Failures:** a missing tool aborts before anything is installed. If one manager's install fails, the others still run and the exit code is 1.
-- **Privileges:** apt uses `sudo` when you are not root. npm, pipx and composer run as your user. If npm's default global prefix is not writable, `~/.local` is used instead (override with `PD_NPM_PREFIX`; an already set `NPM_CONFIG_PREFIX` wins). In that case system-wide npm packages do not count as installed.
+- **apt index:** base images usually have no apt index. If it is empty, `apt-get update` runs automatically before the install (and only if there is something to install). `--update` forces it. Downloads are retried 3 times.
+- **Root or not:**
+  - As **root** everything is installed system-wide: `pipx --global`, composer with `COMPOSER_HOME=/usr/local/composer` and `COMPOSER_BIN_DIR=/usr/local/bin`, cargo with `CARGO_INSTALL_ROOT=/usr/local`, go with `GOBIN=/usr/local/bin`, gems into the system gem dir. Variables you already set win.
+  - As a **normal user**: apt uses `sudo`; npm falls back to `~/.local` (or `PD_NPM_PREFIX`) if its prefix is not writable, in that case system-wide npm packages do not count as installed; gems use `--user-install`; the rest installs to the manager's per-user default.
 - **apt virtual packages:** a package counts as installed if an installed package `Provides` it.
 - **pipx URL and path specs** (anything containing `/` or `:`) have no knowable name. They are matched against the specs pipx recorded, using one extra `pipx list --json` call, made only when such a spec is requested. Note that `#` starts a comment, so URL fragments like `#egg=name` cannot be used.
-- **apt index:** `apt-get update` is not run by default, for speed. Use `--update` when the index may be stale.
+- **go:** there is no registry of installed go tools, so the main package path is read from the binaries in the bin dir (`GOBIN`, else `$GOPATH/bin`) with one `go version -m` call. Packages are installed one `go install` call at a time. Tools installed in a different directory than `GOBIN` are not recognised.
+- **`--clean`:** apt lists and `apt-get clean`; `npm cache clean`; pip/pipx caches; `composer clear-cache`; cargo registry and git caches; gem cache; `go clean -cache -modcache`. Only for managers that installed something in this run. Removing the apt lists means the next `pd` run in a later layer refreshes the index again, which is automatic.
+
+## Docker
+
+Every release publishes an image that contains nothing but the script, so no `curl` or `apt install` is needed in your image:
+
+```dockerfile
+FROM debian:stable-slim
+COPY --from=ghcr.io/<owner>/packagedealer:1 /usr/local/bin/pd /usr/local/bin/pd
+COPY packages.txt /tmp/packages.txt
+RUN pd --clean --no-recommends -f /tmp/packages.txt
+```
+
+Tags: `1.2.3`, `1.2`, `1` and `latest`. Layering:
+
+```dockerfile
+FROM my-base                      # may already contain some of the packages
+COPY --from=ghcr.io/<owner>/packagedealer:1 /usr/local/bin/pd /usr/local/bin/pd
+COPY team.apt team.node /etc/packagedealer.d/
+RUN pd --clean --dir /etc/packagedealer.d
+```
+
+To verify an image contains everything (for example in a test stage): `pd --check --dir /etc/packagedealer.d`.
 
 ## Development
 
@@ -113,13 +162,12 @@ Pins are allowed and are stripped when checking whether a package is installed. 
 make test      # shellcheck + shellspec
 make lint      # shellcheck only
 make spec      # shellspec only
+make image     # docker build
 ```
 
 Tests use [shellspec](https://github.com/shellspec/shellspec), cloned into `vendor/shellspec` on first run (needs `git` and network access). The specs run against stub package managers (`spec/support/stub`), so no real packages are installed.
 
 ## CI and releases
 
-- GitHub Actions runs `make test` on every push to `main` and on every pull request.
-- Pushing a tag like `v1.2.3` runs the tests and creates a GitHub release with generated notes and the `PackageDealer` script attached.
-
-The version printed by `pd --version` is the `PD_VERSION` variable at the top of the script. Update it before tagging.
+- GitHub Actions runs `make test` and a test build of the image on every push to `main` and on every pull request.
+- Pushing a tag like `v1.2.3` runs the tests, stamps `1.2.3` into the script (`pd --version`), creates a GitHub release with generated notes and the `PackageDealer` script attached, and pushes the image to `ghcr.io/<owner>/packagedealer`.

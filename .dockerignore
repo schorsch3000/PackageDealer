@@ -1,0 +1,7 @@
+.git
+.github
+.az
+.idea
+vendor
+spec
+*.md

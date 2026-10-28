@@ -2,7 +2,7 @@ SHELLSPEC ?= vendor/shellspec/shellspec
 SHELLCHECK ?= shellcheck
 LINT_FILES = PackageDealer spec/spec_helper.sh spec/support/stub
 
-.PHONY: all test lint spec
+.PHONY: all test lint spec image
 
 all: test
 
@@ -17,3 +17,6 @@ spec: $(SHELLSPEC)
 
 $(SHELLSPEC):
 	git clone --depth 1 https://github.com/shellspec/shellspec.git vendor/shellspec
+
+image:
+	docker build -t packagedealer .

@@ -1,24 +1,34 @@
 #!/usr/bin/env bash
-# PackageDealer - install packages with apt, npm, pipx and composer, fast.
+# PackageDealer - install packages with apt, npm, pipx, composer, cargo, gem
+# and go, fast.
 #
 # Speed strategy: never ask a package manager "is X installed?" per package.
 # Fetch each manager's installed list once (in parallel), diff in memory,
 # then install everything that is missing in ONE call per manager.
 # Already installed packages are never touched, never upgraded.
+#
+# Built for container images: running as root installs system-wide, an empty
+# apt index is refreshed automatically, --clean removes caches again.
 
 PD_VERSION=0.1.0
 
-# Install order matters: apt may provide node/python/php for the others.
-PD_MANAGERS=(apt node pipx composer)
+# Install order matters: apt may provide the toolchains for the others.
+PD_MANAGERS=(apt node pipx composer cargo gem go)
 
 # shellcheck disable=SC2034  # used via namerefs
-declare -a WANT_apt=() WANT_node=() WANT_pipx=() WANT_composer=()
+declare -a WANT_apt=() WANT_node=() WANT_pipx=() WANT_composer=() WANT_cargo=() WANT_gem=() WANT_go=()
 declare -A PD_SEEN=()
 PD_DRY_RUN=0
+PD_CHECK=0
+PD_CLEAN=0
 PD_APT_UPDATE=0
+PD_APT_NO_RECOMMENDS=0
+PD_VERBOSE=0          # -1 quiet, 0 normal, 1 verbose
 PD_STDIN_USED=0
 PD_TMP=
-PD_SOURCES=()   # "mode:file" mode = manager name or "mixed"
+PD_SOURCES=()         # "mode:file", mode = manager name or "mixed"
+PD_PIPX_GLOBAL=()
+PD_GEM_USER=()
 
 shopt -s extglob
 
@@ -28,35 +38,65 @@ Usage: PackageDealer [options]
 
 Install packages globally; skip what is already installed.
 
-Options:
-  -a, --apt FILE        file with apt packages, one per line
-  -n, --node FILE       file with npm packages (installed with npm -g)
-  -p, --pipx FILE       file with pipx packages
-  -c, --composer FILE   file with composer packages (composer global require)
-  -f, --file FILE       file with prefixed lines: a:foo n:bar p:baz c:vendor/pkg
-  -u, --update          run apt-get update before installing (only if apt has work)
+Package sources (repeatable; FILE "-" reads stdin, once):
+  -a, --apt FILE        apt packages, one per line
+  -n, --node FILE       npm packages (npm install -g)
+  -p, --pipx FILE       pipx packages
+  -c, --composer FILE   composer packages (composer global require)
+  -r, --cargo FILE      cargo crates (cargo install)
+  -e, --gem FILE        ruby gems (gem install)
+  -g, --go FILE         go packages (go install, @latest if no version)
+  -f, --file FILE       prefixed lines: a:foo n:bar p:baz c:vendor/pkg
+                        r:crate e:gem g:module/path (or apt: node: pipx:
+                        composer: cargo: gem: go:)
+  -D, --dir DIR         read every file in DIR: *.apt *.node *.pipx
+                        *.composer *.cargo *.gem *.go (one per line),
+                        *.txt (prefixed lines), sorted by name
+
+Behaviour:
+  -u, --update          run apt-get update first (only if apt has work);
+                        done automatically when the apt index is empty
+  -R, --no-recommends   apt: --no-install-recommends
+      --clean           remove package caches of installed managers afterwards
   -d, --dry-run         only print what would be installed
+      --check           like --dry-run, but exit 1 if anything is missing
+  -q, --quiet           only errors
+  -v, --verbose         print the commands that are run
   -h, --help            show this help
   -V, --version         show version
 
-Every file option may be repeated; FILE "-" reads stdin (once). If no "-" is
-given and stdin is not a terminal, "-f -" is assumed. Blank lines, whitespace
-around names and everything after '#' are ignored. Environment: PD_NPM_PREFIX (npm prefix used when
-the default one is not writable, default ~/.local).
+If no "-" is given and stdin is not a terminal, "-f -" is assumed. Blank
+lines, whitespace around names and everything after '#' are ignored.
+
+As root everything is installed system-wide. Otherwise: apt uses sudo, npm
+falls back to PD_NPM_PREFIX (default ~/.local) if its prefix is not writable,
+gem uses --user-install.
 EOF
 }
 
-pd_log() { printf 'PackageDealer: %s\n' "$*" >&2; }
-pd_die() { pd_log "error: $*"; exit 1; }
+pd_log()  { printf 'PackageDealer: %s\n' "$*" >&2; }
+pd_info() { if ((PD_VERBOSE >= 0)); then pd_log "$@"; fi; }
+pd_die()  { pd_log "error: $*"; exit 1; }
+pd_is_root() { ((${PD_EUID:-$EUID} == 0)); }
+
+# Run a command; show it with -v.
+pd_run() {
+  if ((PD_VERBOSE > 0)); then printf '+ %s\n' "$*" >&2; fi
+  "$@"
+}
 
 # ---------------------------------------------------------------- parsing
 
-pd_short_to_manager() {
+# pd_prefix_to_manager PREFIX -> REPLY
+pd_prefix_to_manager() {
   case $1 in
-    a) REPLY=apt ;;
-    n) REPLY=node ;;
-    p) REPLY=pipx ;;
-    c) REPLY=composer ;;
+    a|apt) REPLY=apt ;;
+    n|node|npm) REPLY=node ;;
+    p|pipx) REPLY=pipx ;;
+    c|composer) REPLY=composer ;;
+    r|cargo) REPLY=cargo ;;
+    e|gem) REPLY=gem ;;
+    g|go) REPLY=go ;;
     *) return 1 ;;
   esac
 }
@@ -85,9 +125,9 @@ pd_read_file() {
     line=${line%%+([[:space:]])}
     [[ -z $line ]] && continue
     if [[ $mode == mixed ]]; then
-      if [[ $line =~ ^([a-z]):[[:space:]]*(.+)$ ]] \
-        && pd_short_to_manager "${BASH_REMATCH[1]}"; then :; else
-        pd_die "$file:$n: expected a:|n:|p:|c: prefix, got '$line'"
+      if [[ $line =~ ^([a-z]+):[[:space:]]*(.+)$ ]] \
+        && pd_prefix_to_manager "${BASH_REMATCH[1]}"; then :; else
+        pd_die "$file:$n: expected a manager prefix (a: n: p: c: r: e: g:), got '$line'"
       fi
       mgr=$REPLY
       line=${BASH_REMATCH[2]}
@@ -97,6 +137,21 @@ pd_read_file() {
     pd_add_want "$mgr" "$line"
   done
   exec 3<&-
+}
+
+# pd_add_dir DIR: queue every recognised file in DIR
+pd_add_dir() {
+  local dir=$1 f ext
+  [[ -d $dir ]] || pd_die "not a directory: $dir"
+  for f in "$dir"/*; do
+    [[ -f $f ]] || continue
+    ext=${f##*.}
+    case $ext in
+      apt|pipx|composer|cargo|gem|go) PD_SOURCES+=("$ext:$f") ;;
+      node|npm) PD_SOURCES+=("node:$f") ;;
+      txt) PD_SOURCES+=("mixed:$f") ;;
+    esac
+  done
 }
 
 # ------------------------------------------------------------ name keys
@@ -119,6 +174,14 @@ pd_key() {
     composer)
       n=${s%%[:=^~\ ]*}
       REPLY=${n,,} ;;
+    cargo)
+      n=${s%%@*}
+      n=${n,,}
+      REPLY=${n//_/-} ;;
+    gem)
+      REPLY=$s ;;
+    go)
+      REPLY=${s%%@*} ;;
     *) return 1 ;;
   esac
 }
@@ -146,7 +209,7 @@ pd_list_node() {
 }
 
 pd_list_pipx() {
-  pipx list --short 2>/dev/null | while read -r name _; do
+  pipx list --short "${PD_PIPX_GLOBAL[@]}" 2>/dev/null | while read -r name _; do
     [[ -n $name ]] || continue
     name=${name,,}
     printf '%s\n' "${name//+([-_.])/-}"
@@ -156,7 +219,7 @@ pd_list_pipx() {
   local spec
   for spec in "${WANT_pipx[@]}"; do
     if [[ $spec == *[/:]* ]]; then
-      pipx list --json 2>/dev/null \
+      pipx list --json "${PD_PIPX_GLOBAL[@]}" 2>/dev/null \
         | sed -n 's/^ *"package_or_url": *"\(.*\)",\{0,1\}$/\1/p'
       break
     fi
@@ -168,10 +231,39 @@ pd_list_composer() {
     | awk 'NF { print tolower($1) }'
 }
 
+pd_list_cargo() {
+  cargo install --list 2>/dev/null \
+    | awk '/^[^[:space:]]/ { n = $1; sub(/:$/, "", n); gsub(/_/, "-", n); print tolower(n) }'
+}
+
+pd_list_gem() {
+  gem list --local --no-versions 2>/dev/null \
+    | awk 'NF == 1 && $1 !~ /^\*/ { print $1 }'
+}
+
+# go has no registry of installed tools: ask the binaries in the bin dir for
+# the main package path they were built from (one `go version -m` call).
+pd_go_bindir() {
+  local p
+  if [[ -n ${GOBIN:-} ]]; then
+    REPLY=$GOBIN
+  else
+    p=${GOPATH:-$HOME/go}
+    REPLY=${p%%:*}/bin
+  fi
+}
+
+pd_list_go() {
+  pd_go_bindir
+  [[ -d $REPLY ]] || return 0
+  { go version -m "$REPLY"/* 2>/dev/null || true; } \
+    | awk -F'\t' '$2 == "path" { print $3 }'
+}
+
 # ------------------------------------------------------------- installing
 
 pd_as_root() {
-  if [[ ${PD_EUID:-$EUID} -eq 0 ]]; then
+  if pd_is_root; then
     "$@"
   elif command -v sudo >/dev/null 2>&1; then
     sudo "$@"
@@ -180,33 +272,129 @@ pd_as_root() {
   fi
 }
 
-pd_install_apt() {
-  if ((PD_APT_UPDATE)); then
-    pd_as_root env DEBIAN_FRONTEND=noninteractive apt-get update || return 1
-  fi
-  pd_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-upgrade "$@"
+pd_apt_lists_dir() { REPLY=${PD_APT_LISTS:-/var/lib/apt/lists}; }
+
+# Base images ship without an apt index; installs would fail without update.
+pd_apt_lists_empty() {
+  pd_apt_lists_dir
+  ! compgen -G "$REPLY/*_Packages*" >/dev/null
 }
-pd_install_node()     { npm install -g "$@"; }
-pd_install_pipx()     { pipx install "$@"; }
-pd_install_composer() { composer global require --no-interaction "$@"; }
+
+pd_install_apt() {
+  local apt=(env DEBIAN_FRONTEND=noninteractive apt-get)
+  local opts=(-o Acquire::Retries=3)
+  ((PD_VERBOSE < 0)) && opts+=(-q)
+  if ((PD_APT_UPDATE)) || pd_apt_lists_empty; then
+    pd_run pd_as_root "${apt[@]}" update "${opts[@]}" || return 1
+  fi
+  ((PD_APT_NO_RECOMMENDS)) && opts+=(--no-install-recommends)
+  pd_run pd_as_root "${apt[@]}" install -y --no-upgrade "${opts[@]}" "$@"
+}
+
+pd_install_node() {
+  local q=()
+  ((PD_VERBOSE < 0)) && q=(--loglevel=error)
+  pd_run npm install -g "${q[@]}" "$@"
+}
+
+pd_install_pipx() {
+  local q=()
+  ((PD_VERBOSE < 0)) && q=(--quiet)
+  pd_run pipx install "${PD_PIPX_GLOBAL[@]}" "${q[@]}" "$@"
+}
+
+pd_install_composer() {
+  local q=()
+  ((PD_VERBOSE < 0)) && q=(-q)
+  pd_run composer global require --no-interaction "${q[@]}" "$@"
+}
+
+pd_install_cargo() {
+  local q=()
+  ((PD_VERBOSE < 0)) && q=(-q)
+  pd_run cargo install "${q[@]}" "$@"
+}
+
+pd_install_gem() {
+  local q=()
+  ((PD_VERBOSE < 0)) && q=(--quiet)
+  pd_run gem install --no-document "${PD_GEM_USER[@]}" "${q[@]}" "$@"
+}
+
+# go install needs a version and cannot mix modules reliably: one call each.
+pd_install_go() {
+  local p rc=0
+  for p in "$@"; do
+    [[ $p == *@* ]] || p+=@latest
+    pd_run go install "$p" || rc=1
+  done
+  return $rc
+}
+
+# ---------------------------------------------------------------- cleaning
+
+pd_clean_apt() {
+  pd_apt_lists_dir
+  pd_run pd_as_root apt-get clean
+  pd_run pd_as_root rm -rf -- "$REPLY"/*
+}
+pd_clean_node()     { pd_run npm cache clean --force; }
+pd_clean_pipx()     { pd_run rm -rf -- "${XDG_CACHE_HOME:-$HOME/.cache}/pip" "${XDG_CACHE_HOME:-$HOME/.cache}/pipx"; }
+pd_clean_composer() { pd_run composer clear-cache --no-interaction; }
+pd_clean_cargo() {
+  local home=${CARGO_HOME:-$HOME/.cargo}
+  pd_run rm -rf -- "$home/registry" "$home/git"
+}
+pd_clean_gem() {
+  local dir
+  dir=$(gem env gemdir 2>/dev/null) || return 0
+  pd_run rm -rf -- "$dir/cache"
+}
+pd_clean_go() { pd_run go clean -cache -modcache; }
+
+# ------------------------------------------------- per-manager environment
+# Run in the main shell before the list calls, so list and install agree.
 
 pd_tools_for() {
   case $1 in
     apt) REPLY="apt-get dpkg-query" ;;
     node) REPLY="npm" ;;
-    pipx) REPLY="pipx" ;;
-    composer) REPLY="composer" ;;
+    *) REPLY=$1 ;;
   esac
 }
 
 # Non-root users usually cannot write npm's default global prefix.
-pd_setup_npm_prefix() {
-  [[ -n ${NPM_CONFIG_PREFIX:-} || ${PD_EUID:-$EUID} -eq 0 ]] && return 0
+pd_setup_node() {
+  [[ -n ${NPM_CONFIG_PREFIX:-} ]] && return 0
+  pd_is_root && return 0
   local prefix
   prefix=$(npm config get prefix 2>/dev/null) || return 0
   if [[ ! -w $prefix ]]; then
     export NPM_CONFIG_PREFIX=${PD_NPM_PREFIX:-$HOME/.local}
   fi
+}
+
+pd_setup_pipx() {
+  if pd_is_root; then PD_PIPX_GLOBAL=(--global); fi
+}
+
+pd_setup_composer() {
+  pd_is_root || return 0
+  export COMPOSER_ALLOW_SUPERUSER=1
+  export COMPOSER_HOME=${COMPOSER_HOME:-/usr/local/composer}
+  export COMPOSER_BIN_DIR=${COMPOSER_BIN_DIR:-/usr/local/bin}
+}
+
+pd_setup_cargo() {
+  if pd_is_root; then export CARGO_INSTALL_ROOT=${CARGO_INSTALL_ROOT:-/usr/local}; fi
+}
+
+pd_setup_gem() {
+  pd_is_root || PD_GEM_USER=(--user-install)
+}
+
+pd_setup_go() {
+  if pd_is_root; then export GOBIN=${GOBIN:-/usr/local/bin}; fi
 }
 
 # --------------------------------------------------------------- main flow
@@ -229,9 +417,18 @@ pd_parse_args() {
       -n|--node)     pd_add_source node "$@"; shift 2 ;;
       -p|--pipx)     pd_add_source pipx "$@"; shift 2 ;;
       -c|--composer) pd_add_source composer "$@"; shift 2 ;;
+      -r|--cargo)    pd_add_source cargo "$@"; shift 2 ;;
+      -e|--gem)      pd_add_source gem "$@"; shift 2 ;;
+      -g|--go)       pd_add_source go "$@"; shift 2 ;;
       -f|--file)     pd_add_source mixed "$@"; shift 2 ;;
+      -D|--dir)      [[ $# -ge 2 ]] || pd_die "$1 needs a directory"; pd_add_dir "$2"; shift 2 ;;
       -u|--update)   PD_APT_UPDATE=1; shift ;;
+      -R|--no-recommends) PD_APT_NO_RECOMMENDS=1; shift ;;
+      --clean)       PD_CLEAN=1; shift ;;
       -d|--dry-run)  PD_DRY_RUN=1; shift ;;
+      --check)       PD_DRY_RUN=1; PD_CHECK=1; shift ;;
+      -q|--quiet)    PD_VERBOSE=-1; shift ;;
+      -v|--verbose)  PD_VERBOSE=1; shift ;;
       -h|--help)     pd_usage; exit 0 ;;
       -V|--version)  echo "PackageDealer $PD_VERSION"; exit 0 ;;
       *)             pd_usage >&2; pd_die "unknown argument: $1" ;;
@@ -272,7 +469,7 @@ pd_main() {
     unset -n _w
   done
   if ((${#active[@]} == 0)); then
-    pd_log "nothing to do"
+    pd_info "nothing to do"
     return 0
   fi
 
@@ -287,7 +484,9 @@ pd_main() {
   PD_TMP=$(mktemp -d)
   trap 'rm -rf "$PD_TMP"' EXIT
 
-  [[ " ${active[*]} " == *" node "* ]] && pd_setup_npm_prefix
+  for mgr in "${active[@]}"; do
+    if declare -F "pd_setup_$mgr" >/dev/null; then "pd_setup_$mgr"; fi
+  done
 
   # One list call per manager, all in parallel.
   local -A pids=()
@@ -305,19 +504,29 @@ pd_main() {
   ((failed)) && return 1
 
   # Sequential installs, one batch per manager.
-  local rc=0 missing
+  local rc=0 missing any_missing=0 attempted=()
   for mgr in "${active[@]}"; do
     pd_compute_missing "$mgr" missing
     local -n _w="WANT_$mgr"
-    pd_log "$mgr: ${#missing[@]} to install, $((${#_w[@]} - ${#missing[@]})) already present"
+    pd_info "$mgr: ${#missing[@]} to install, $((${#_w[@]} - ${#missing[@]})) already present"
     unset -n _w
     ((${#missing[@]})) || continue
+    any_missing=1
     if ((PD_DRY_RUN)); then
       printf '%s: %s\n' "$mgr" "${missing[*]}"
       continue
     fi
+    attempted+=("$mgr")
     "pd_install_$mgr" "${missing[@]}" || { pd_log "error: $mgr install failed"; rc=1; }
   done
+
+  if ((PD_CHECK && any_missing)); then return 1; fi
+
+  if ((PD_CLEAN)); then
+    for mgr in "${attempted[@]}"; do
+      "pd_clean_$mgr" || pd_log "warning: cleaning $mgr failed"
+    done
+  fi
   return $rc
 }
 

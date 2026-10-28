@@ -15,3 +15,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test (shellcheck + shellspec)
         run: make test
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (not pushed)
+        run: docker build -t packagedealer .
