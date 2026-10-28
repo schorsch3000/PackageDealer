@@ -331,7 +331,8 @@ JSON
     It 'fails early when a manager tool is missing'
       echo foo >"$PD_SANDBOX/c.txt"
       rm "$PD_SANDBOX/bin/composer"
-      When run env PATH="$PD_SANDBOX/bin:/usr/bin:/bin" "$PD_ROOT/PackageDealer" --composer "$PD_SANDBOX/c.txt"
+      # PATH holds only the stubs, so a real composer on the host cannot leak in
+      When run env PATH="$PD_SANDBOX/bin" "$(command -v bash)" "$PD_ROOT/PackageDealer" --composer "$PD_SANDBOX/c.txt"
       The status should be failure
       The stderr should include "'composer' not found"
     End
