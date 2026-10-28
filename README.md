@@ -87,6 +87,7 @@ Each image layer drops its own file into a shared directory and runs `pd --dir`;
 | `-g`, `--go FILE`       | go packages (`@latest` is added when no version is given)            |
 | `-f`, `--file FILE`     | prefixed lines                                                       |
 | `-D`, `--dir DIR`       | all recognised files in a directory                                  |
+| `-U`, `--upgrade`       | also upgrade the listed packages that are already installed (implies `--update`) |
 | `-u`, `--update`        | run `apt-get update` first (only if apt has something to install)    |
 | `-R`, `--no-recommends` | apt: `--no-install-recommends`                                       |
 | `--clean`               | remove package caches of the managers that installed something       |
@@ -125,6 +126,15 @@ Pins are allowed (except for gems) and are stripped when checking whether a pack
 
 - **Order:** apt, node, pipx, composer, cargo, gem, go. apt comes first because it often provides node, python, php, ruby, rust or go for the others.
 - **Failures:** a missing tool aborts before anything is installed. If one manager's install fails, the others still run and the exit code is 1.
+- **`--upgrade`:** only the packages named in your files are upgraded, never everything that is installed. Without the flag nothing is ever upgraded. Per manager:
+  - apt: one `apt-get install` for all listed packages, without `--no-upgrade`.
+  - node: `npm install -g name@latest`; pinned specs (`name@5`) install exactly that.
+  - cargo: one `cargo install` for all listed crates.
+  - go: `go install pkg@latest` for each.
+  - pipx: `pipx upgrade` for installed, unpinned packages; missing ones are installed. URL/path specs cannot be upgraded (a warning is printed).
+  - composer: `composer global update` for installed, unpinned packages (within their constraints); missing ones are required.
+  - gem: `gem update` for installed gems; missing ones are installed.
+  - Pinned specs (`black==24`, `vendor/pkg:^1`) are left alone for pipx and composer.
 - **apt index:** base images usually have no apt index. If it is empty, `apt-get update` runs automatically before the install (and only if there is something to install). `--update` forces it. Downloads are retried 3 times.
 - **Root or not:**
   - As **root** everything is installed system-wide: `pipx --global`, composer with `COMPOSER_HOME=/usr/local/composer` and `COMPOSER_BIN_DIR=/usr/local/bin`, cargo with `CARGO_INSTALL_ROOT=/usr/local`, go with `GOBIN=/usr/local/bin`, gems into the system gem dir. Variables you already set win.

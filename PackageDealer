@@ -22,6 +22,7 @@ PD_DRY_RUN=0
 PD_CHECK=0
 PD_CLEAN=0
 PD_APT_UPDATE=0
+PD_UPGRADE=0
 PD_APT_NO_RECOMMENDS=0
 PD_VERBOSE=0          # -1 quiet, 0 normal, 1 verbose
 PD_STDIN_USED=0
@@ -54,6 +55,9 @@ Package sources (repeatable; FILE "-" reads stdin, once):
                         *.txt (prefixed lines), sorted by name
 
 Behaviour:
+  -U, --upgrade         also upgrade the listed packages that are already
+                        installed (implies --update). Pinned specs are not
+                        upgraded. Without it nothing is ever upgraded.
   -u, --update          run apt-get update first (only if apt has work);
                         done automatically when the apt index is empty
   -R, --no-recommends   apt: --no-install-recommends
@@ -288,12 +292,22 @@ pd_install_apt() {
     pd_run pd_as_root "${apt[@]}" update "${opts[@]}" || return 1
   fi
   ((PD_APT_NO_RECOMMENDS)) && opts+=(--no-install-recommends)
-  pd_run pd_as_root "${apt[@]}" install -y --no-upgrade "${opts[@]}" "$@"
+  local flags=(-y)
+  ((PD_UPGRADE)) || flags+=(--no-upgrade)
+  pd_run pd_as_root "${apt[@]}" install "${flags[@]}" "${opts[@]}" "$@"
 }
 
 pd_install_node() {
   local q=()
   ((PD_VERBOSE < 0)) && q=(--loglevel=error)
+  if ((PD_UPGRADE)); then
+    local specs=() s
+    for s in "$@"; do
+      pd_key node "$s"
+      if [[ $REPLY == "$s" ]]; then specs+=("$s@latest"); else specs+=("$s"); fi
+    done
+    set -- "${specs[@]}"
+  fi
   pd_run npm install -g "${q[@]}" "$@"
 }
 
@@ -319,6 +333,45 @@ pd_install_gem() {
   local q=()
   ((PD_VERBOSE < 0)) && q=(--quiet)
   pd_run gem install --no-document "${PD_GEM_USER[@]}" "${q[@]}" "$@"
+}
+
+# Managers whose install call also upgrades when asked (given all specs):
+# apt (no --no-upgrade), node (@latest), cargo, go (@latest).
+pd_upgrade_inline() {
+  case $1 in apt|node|cargo|go) return 0 ;; *) return 1 ;; esac
+}
+
+# pd_upgrade_MANAGER installed-specs...  (only for the others)
+pd_upgrade_pipx() {
+  local q=() s names=()
+  ((PD_VERBOSE < 0)) && q=(--quiet)
+  for s in "$@"; do
+    pd_key pipx "$s"
+    if [[ $REPLY == "$s" && $s == *[/:]* ]]; then
+      pd_log "warning: cannot upgrade url/path spec '$s'"
+    elif [[ $REPLY == "$s" ]]; then
+      names+=("$REPLY")      # unpinned
+    fi                       # pinned: stays
+  done
+  ((${#names[@]})) || return 0
+  pd_run pipx upgrade "${PD_PIPX_GLOBAL[@]}" "${q[@]}" "${names[@]}"
+}
+
+pd_upgrade_composer() {
+  local q=() s names=()
+  ((PD_VERBOSE < 0)) && q=(-q)
+  for s in "$@"; do
+    pd_key composer "$s"
+    if [[ ${REPLY} == "${s,,}" ]]; then names+=("$REPLY"); fi   # pinned: stays
+  done
+  ((${#names[@]})) || return 0
+  pd_run composer global update --no-interaction "${q[@]}" "${names[@]}"
+}
+
+pd_upgrade_gem() {
+  local q=()
+  ((PD_VERBOSE < 0)) && q=(--quiet)
+  pd_run gem update "${PD_GEM_USER[@]}" "${q[@]}" "$@"
 }
 
 # go install needs a version and cannot mix modules reliably: one call each.
@@ -423,6 +476,7 @@ pd_parse_args() {
       -f|--file)     pd_add_source mixed "$@"; shift 2 ;;
       -D|--dir)      [[ $# -ge 2 ]] || pd_die "$1 needs a directory"; pd_add_dir "$2"; shift 2 ;;
       -u|--update)   PD_APT_UPDATE=1; shift ;;
+      -U|--upgrade)  PD_UPGRADE=1; PD_APT_UPDATE=1; shift ;;
       -R|--no-recommends) PD_APT_NO_RECOMMENDS=1; shift ;;
       --clean)       PD_CLEAN=1; shift ;;
       -d|--dry-run)  PD_DRY_RUN=1; shift ;;
@@ -444,18 +498,20 @@ pd_parse_args() {
   done
 }
 
-# pd_compute_missing MANAGER OUTVAR
+# pd_compute_missing MANAGER MISSING_OUTVAR PRESENT_OUTVAR
 pd_compute_missing() {
   local mgr=$1
   local -n _missing=$2
+  local -n _present=$3
   local -n _want="WANT_$mgr"
   local -A have=()
   local key spec
   while IFS= read -r key; do have[$key]=1; done <"$PD_TMP/$mgr"
   _missing=()
+  _present=()
   for spec in "${_want[@]}"; do
     pd_key "$mgr" "$spec"
-    [[ -n ${have[$REPLY]:-} ]] || _missing+=("$spec")
+    if [[ -n ${have[$REPLY]:-} ]]; then _present+=("$spec"); else _missing+=("$spec"); fi
   done
 }
 
@@ -504,20 +560,32 @@ pd_main() {
   ((failed)) && return 1
 
   # Sequential installs, one batch per manager.
-  local rc=0 missing any_missing=0 attempted=()
+  local rc=0 missing present todo ups any_missing=0 attempted=()
   for mgr in "${active[@]}"; do
-    pd_compute_missing "$mgr" missing
-    local -n _w="WANT_$mgr"
-    pd_info "$mgr: ${#missing[@]} to install, $((${#_w[@]} - ${#missing[@]})) already present"
-    unset -n _w
-    ((${#missing[@]})) || continue
-    any_missing=1
+    pd_compute_missing "$mgr" missing present
+    todo=("${missing[@]}")
+    ups=()
+    if ((PD_UPGRADE)); then
+      local -n _w="WANT_$mgr"
+      if pd_upgrade_inline "$mgr"; then todo=("${_w[@]}"); else ups=("${present[@]}"); fi
+      unset -n _w
+      pd_info "$mgr: ${#missing[@]} to install, ${#present[@]} to upgrade"
+    else
+      pd_info "$mgr: ${#missing[@]} to install, ${#present[@]} already present"
+    fi
+    ((${#missing[@]})) && any_missing=1
     if ((PD_DRY_RUN)); then
-      printf '%s: %s\n' "$mgr" "${missing[*]}"
+      ((${#missing[@]})) && printf '%s: %s\n' "$mgr" "${missing[*]}"
+      if ((PD_UPGRADE && ${#present[@]})); then printf '%s upgrade: %s\n' "$mgr" "${present[*]}"; fi
       continue
     fi
-    attempted+=("$mgr")
-    "pd_install_$mgr" "${missing[@]}" || { pd_log "error: $mgr install failed"; rc=1; }
+    if ((${#todo[@]} + ${#ups[@]})); then attempted+=("$mgr"); fi
+    if ((${#todo[@]})); then
+      "pd_install_$mgr" "${todo[@]}" || { pd_log "error: $mgr install failed"; rc=1; }
+    fi
+    if ((${#ups[@]})); then
+      "pd_upgrade_$mgr" "${ups[@]}" || { pd_log "error: $mgr upgrade failed"; rc=1; }
+    fi
   done
 
   if ((PD_CHECK && any_missing)); then return 1; fi
